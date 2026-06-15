@@ -1,8 +1,11 @@
 import logging
+import io
 from dataclasses import dataclass
 
+import msgpack
 import numpy as np
 import torch
+import zmq
 from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
 from molmo_spaces.configs.camera_configs import RBY1GoProD455CameraSystem
 from molmo_spaces.configs.robot_configs import FrankaRobotConfig, RBY1MConfig
@@ -11,6 +14,46 @@ from molmo_spaces.policy.base_policy import InferencePolicy, StatefulPolicy
 from molmo_spaces.evaluation.configs.evaluation_configs import JsonBenchmarkEvalConfig
 
 logger = logging.getLogger(__name__)
+
+
+class _Gr00tZmqClient:
+    """Tiny client for GR00T PolicyServer without importing the GR00T package."""
+
+    def __init__(self, host: str, port: int, timeout_ms: int = 120_000):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REQ)
+        self.socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+        self.socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
+        self.socket.connect(f"tcp://{host}:{port}")
+
+    def _encode(self, obj):
+        if isinstance(obj, np.ndarray):
+            output = io.BytesIO()
+            np.save(output, obj, allow_pickle=False)
+            return {"__ndarray_class__": True, "as_npy": output.getvalue()}
+        return obj
+
+    def _decode(self, obj):
+        if isinstance(obj, dict) and "__ndarray_class__" in obj:
+            return np.load(io.BytesIO(obj["as_npy"]), allow_pickle=False)
+        return obj
+
+    def call(self, endpoint: str, data: dict | None = None, requires_input: bool = True):
+        request = {"endpoint": endpoint}
+        if requires_input:
+            request["data"] = data or {}
+        self.socket.send(msgpack.packb(request, default=self._encode))
+        response = msgpack.unpackb(self.socket.recv(), object_hook=self._decode)
+        if isinstance(response, dict) and "error" in response:
+            raise RuntimeError(f"GR00T policy server error: {response['error']}")
+        return response
+
+    def get_action(self, observation: dict) -> tuple[dict, dict]:
+        response = self.call("get_action", {"observation": observation, "options": None})
+        return tuple(response)
+
+    def reset(self):
+        return self.call("reset", {"options": None})
 
 
 @dataclass
@@ -258,6 +301,280 @@ class SynthVLAPolicyConfig(BasePolicyConfig):
             from olmo.eval.configure_molmo_spaces import SynthVLAPolicy
 
             object.__setattr__(self, "policy_cls", SynthVLAPolicy)
+
+
+@dataclass
+class Gr00tServerPolicyState:
+    action_buffer: list[dict[str, np.ndarray]] | None = None
+    buffer_index: int = 0
+    step_count: int = 0
+
+
+class Gr00tDroidJointPosServerPolicy(InferencePolicy, StatefulPolicy):
+    """MolmoSpaces policy adapter for a running GR00T DROID policy server.
+
+    The GR00T checkpoint/server stays in the GR00T environment. MolmoSpaces sends
+    simulator observations over ZMQ using GR00T's flat simulation format. For
+    two-camera checkpoints this sends ``video.exterior_image_1_left`` and
+    ``video.wrist_image_left``; for full DROID checkpoints it can also send
+    ``video.exterior_image_2_left``.
+    """
+
+    def __init__(self, config: MlSpacesExpConfig, task_type: str):
+        super().__init__(config, task_type)
+        pc = config.policy_config
+        self.camera_names = pc.camera_names
+        self.action_horizon = pc.action_horizon
+        self.execute_horizon = pc.execute_horizon
+        self.gripper_threshold = pc.gripper_threshold
+        self.gripper_closed_value = pc.gripper_closed_value
+        self.gripper_open_value = pc.gripper_open_value
+        self.joint_action_mode = pc.joint_action_mode
+        self.max_joint_step = pc.max_joint_step
+        if self.max_joint_step is not None:
+            self.max_joint_step = np.asarray(self.max_joint_step, dtype=np.float32)
+        self.client = _Gr00tZmqClient(
+            host=pc.policy_host,
+            port=pc.policy_port,
+            timeout_ms=pc.policy_timeout_ms,
+        )
+        self.action_buffer: list[dict[str, np.ndarray]] = []
+        self.buffer_index = 0
+        self.step_count = 0
+
+    def prepare_model(self, model_name: str | None = None):
+        """No-op: this adapter uses an already-running GR00T policy server."""
+        return None
+
+    def _limit_joint_delta(self, delta: np.ndarray) -> tuple[np.ndarray, float]:
+        if self.max_joint_step is None:
+            return delta, 1.0
+        max_delta = self.max_joint_step
+        if max_delta.ndim == 0:
+            max_delta = np.full(delta.shape, float(max_delta), dtype=np.float32)
+        max_delta = np.maximum(max_delta, 1e-6)
+        relative_scale = np.abs(delta) / max_delta
+        max_scale = float(np.max(relative_scale)) if relative_scale.size else 1.0
+        if max_scale > 1.0:
+            return delta / max_scale, max_scale
+        return delta, max_scale
+
+    def _auto_joint_action_mode(self, raw_action: np.ndarray, current_joints: np.ndarray) -> str:
+        raw_mag = float(np.max(np.abs(raw_action))) if raw_action.size else 0.0
+        abs_step_mag = float(np.max(np.abs(raw_action - current_joints))) if raw_action.size else 0.0
+        max_step = 0.08 if self.max_joint_step is None else float(np.max(self.max_joint_step))
+        if raw_mag <= max(0.5, max_step * 4.0) and abs_step_mag >= max(0.5, max_step * 6.0):
+            return "relative"
+        return "absolute"
+
+    def _target_joints_from_policy(self, raw_action: np.ndarray, current_joints: np.ndarray) -> np.ndarray:
+        mode = self.joint_action_mode
+        if mode == "auto":
+            mode = self._auto_joint_action_mode(raw_action, current_joints)
+        if mode == "relative":
+            return current_joints + raw_action
+        if mode == "absolute":
+            return raw_action
+        if mode == "raw":
+            return raw_action
+        raise ValueError(f"Unknown joint_action_mode={self.joint_action_mode!r}")
+
+    def get_state(self):
+        return Gr00tServerPolicyState(
+            action_buffer=self.action_buffer,
+            buffer_index=self.buffer_index,
+            step_count=self.step_count,
+        )
+
+    def set_state(self, state: Gr00tServerPolicyState):
+        self.action_buffer = state.action_buffer if state.action_buffer is not None else []
+        self.buffer_index = state.buffer_index
+        self.step_count = state.step_count
+
+    def reset(self):
+        self.action_buffer = []
+        self.buffer_index = 0
+        self.step_count = 0
+        try:
+            self.client.reset()
+        except Exception as e:
+            logger.warning(f"GR00T server reset failed; continuing: {e}")
+
+    def obs_to_model_input(self, obs) -> dict[str, np.ndarray]:
+        return obs
+
+    def model_output_to_action(self, model_output) -> dict[str, np.ndarray]:
+        return model_output
+
+    @staticmethod
+    def _as_uint8_rgb(image: np.ndarray) -> np.ndarray:
+        arr = np.asarray(image)
+        if arr.dtype != np.uint8:
+            arr = arr.astype(np.float32)
+            if arr.size and arr.max() <= 1.0:
+                arr = arr * 255.0
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+        if arr.ndim == 3 and arr.shape[-1] > 3:
+            arr = arr[..., :3]
+        return arr
+
+    def _camera_image(self, obs: dict, camera_name: str) -> np.ndarray:
+        if camera_name == "exo_camera_1":
+            for key in (
+                "droid_shoulder_light_randomization",
+                "randomized_zed2_analogue_1",
+                "exo_camera_1",
+            ):
+                if key in obs:
+                    return self._as_uint8_rgb(obs[key])
+        elif camera_name == "wrist_camera":
+            for key in ("wrist_camera_zed_mini", "wrist_camera"):
+                if key in obs:
+                    return self._as_uint8_rgb(obs[key])
+        if camera_name not in obs:
+            raise KeyError(f"Camera '{camera_name}' not in observation. Available: {list(obs.keys())}")
+        return self._as_uint8_rgb(obs[camera_name])
+
+    def _populate_action_buffer(self, observation) -> None:
+        obs = observation[0] if isinstance(observation, list) else observation
+
+        exterior = self._camera_image(obs, self.camera_names[0])
+        exterior_2 = None
+        if len(self.camera_names) >= 3:
+            exterior_2 = self._camera_image(obs, self.camera_names[1])
+            wrist = self._camera_image(obs, self.camera_names[2])
+        else:
+            wrist = self._camera_image(obs, self.camera_names[1])
+
+        robot_state = obs["robot_state"]
+        joint_position = np.asarray(robot_state["qpos"]["arm"], dtype=np.float32).reshape(1, 1, 7)
+        gripper_position = np.asarray(robot_state["qpos"]["gripper"], dtype=np.float32)
+        gripper_position = gripper_position[:1].reshape(1, 1, 1)
+
+        goal = obs["task"] if "task" in obs else self.task.get_task_description()
+        language = [goal]
+        request = {
+            "video.exterior_image_1_left": exterior.reshape(1, 1, *exterior.shape),
+            "video.wrist_image_left": wrist.reshape(1, 1, *wrist.shape),
+            "state.joint_position": joint_position,
+            "state.gripper_position": gripper_position,
+            "annotation.language.language_instruction": language,
+            "annotation.language.language_instruction_2": language,
+            "annotation.language.language_instruction_3": language,
+        }
+        if exterior_2 is not None:
+            request["video.exterior_image_2_left"] = exterior_2.reshape(1, 1, *exterior_2.shape)
+
+        action_dict, _ = self.client.get_action(request)
+        joint_actions = np.asarray(action_dict["action.joint_position"])
+        gripper_actions = np.asarray(action_dict["action.gripper_position"])
+        if joint_actions.ndim == 3:
+            joint_actions = joint_actions[0]
+        if gripper_actions.ndim == 3:
+            gripper_actions = gripper_actions[0]
+        if gripper_actions.ndim == 1:
+            gripper_actions = gripper_actions[:, None]
+
+        self.action_buffer = []
+        horizon = min(self.action_horizon, joint_actions.shape[0], gripper_actions.shape[0])
+        reference_joints = joint_position.reshape(7).astype(np.float32)
+        for t in range(horizon):
+            raw_arm = joint_actions[t, :7].astype(np.float32)
+            target_arm = self._target_joints_from_policy(raw_arm, reference_joints)
+            target_delta, max_scale = self._limit_joint_delta(target_arm - reference_joints)
+            arm = (reference_joints + target_delta).astype(np.float32)
+            if max_scale > 1.0 and self.step_count < 5:
+                logger.warning(
+                    "Scaling GR00T joint target step by %.3f: raw=%s reference=%s target=%s limited=%s",
+                    max_scale,
+                    np.array2string(raw_arm, precision=4, suppress_small=True),
+                    np.array2string(reference_joints, precision=4, suppress_small=True),
+                    np.array2string(target_arm, precision=4, suppress_small=True),
+                    np.array2string(arm, precision=4, suppress_small=True),
+                )
+            reference_joints = arm
+            grip = gripper_actions[t, :1]
+            grip = np.where(
+                grip > self.gripper_threshold,
+                self.gripper_closed_value,
+                self.gripper_open_value,
+            ).astype(np.float32)
+            self.action_buffer.append(
+                {
+                    "arm": arm,
+                    "gripper": grip,
+                }
+            )
+        self.buffer_index = 0
+
+    def inference_model(self, model_input) -> dict[str, np.ndarray]:
+        if self.buffer_index >= self.execute_horizon or not self.action_buffer:
+            self._populate_action_buffer(model_input)
+        action = self.action_buffer[self.buffer_index]
+        self.buffer_index += 1
+        self.step_count += 1
+        return action
+
+
+class Gr00tDroidJointPosServerPolicyConfig(BasePolicyConfig):
+    policy_type: str = "learned"
+    policy_cls: type = None
+    checkpoint_path: str = ""
+    policy_host: str = "localhost"
+    policy_port: int = 5555
+    policy_timeout_ms: int = 120_000
+    camera_names: list[str] = ["exo_camera_1", "wrist_camera"]
+    action_horizon: int = 24
+    execute_horizon: int = 8
+    action_keys: dict[str, str] = {
+        "arm": "joint_pos",
+        "gripper": "joint_pos",
+    }
+    joint_action_mode: str = "auto"
+    max_joint_step: list[float] | None = [0.08, 0.08, 0.08, 0.08, 0.08, 0.08, 0.08]
+    gripper_threshold: float = 0.5
+    gripper_open_value: float = 0.0
+    gripper_closed_value: float = 255.0
+
+    def model_post_init(self, __context) -> None:
+        if self.policy_cls is None:
+            from olmo.eval.configure_molmo_spaces import Gr00tDroidJointPosServerPolicy
+
+            object.__setattr__(self, "policy_cls", Gr00tDroidJointPosServerPolicy)
+
+
+class Gr00tDroidJointPosServerFrankaConfig(JsonBenchmarkEvalConfig):
+    policy_config: Gr00tDroidJointPosServerPolicyConfig = Gr00tDroidJointPosServerPolicyConfig()
+    robot_config: FrankaRobotConfig = FrankaRobotConfig()
+    policy_dt_ms: float = 66.0
+
+    def model_post_init(self, __context) -> None:
+        super().model_post_init(__context)
+        self.robot_config.action_noise_config.enabled = False
+        self.robot_config.command_mode["arm"] = "joint_position"
+        self.robot_config.command_mode["gripper"] = "joint_position"
+
+
+class Gr00tDroidJointPosServerFrankaZed2OneConfig(Gr00tDroidJointPosServerFrankaConfig):
+    policy_config: Gr00tDroidJointPosServerPolicyConfig = Gr00tDroidJointPosServerPolicyConfig(
+        camera_names=["randomized_zed2_analogue_1", "wrist_camera"]
+    )
+
+
+class Gr00tDroidJointPosServerFrankaZed2TwoConfig(Gr00tDroidJointPosServerFrankaConfig):
+    policy_config: Gr00tDroidJointPosServerPolicyConfig = Gr00tDroidJointPosServerPolicyConfig(
+        camera_names=["randomized_zed2_analogue_2", "wrist_camera"]
+    )
+
+
+class Gr00tDroidJointPosServerFrankaThreeViewConfig(Gr00tDroidJointPosServerFrankaConfig):
+    policy_config: Gr00tDroidJointPosServerPolicyConfig = Gr00tDroidJointPosServerPolicyConfig(
+        camera_names=[
+            "randomized_zed2_analogue_1",
+            "randomized_zed2_analogue_2",
+            "wrist_camera",
+        ]
+    )
 
 
 class FrankaState8ClampConfig(JsonBenchmarkEvalConfig):

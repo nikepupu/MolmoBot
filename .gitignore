@@ -178,7 +178,12 @@ pyrightconfig.json
 
 benchmarks/
 ckpts/
+checkpoints/
 eval_output/
 wandb/
+MolmoBot/.mlspaces_cache/
+MolmoBot/molmo_spaces_assets/
+debug_data/
+robot_eval/ungraded_eval_results/
 .DS_Store
 .vscode

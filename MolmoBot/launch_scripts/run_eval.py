@@ -15,7 +15,29 @@ import argparse
 import importlib
 from pathlib import Path
 
-from molmo_spaces.evaluation.eval_main import run_evaluation
+
+HF_MIRROR_UNAVAILABLE_RESOURCES = {
+    "robots": {"franka_cap"},
+    "test_data": {
+        "franka_pick",
+        "franka_pick_and_place",
+        "rby1_door_opening",
+        "rby1_pnp",
+        "rum_open_close",
+        "rum_pick",
+    },
+}
+
+
+def use_huggingface_molmo_spaces_resources() -> None:
+    import molmo_spaces.molmo_spaces_constants as molmo_spaces_constants
+
+    molmo_spaces_constants.USE_HUGGING_FACE = True
+    for data_type, sources in HF_MIRROR_UNAVAILABLE_RESOURCES.items():
+        for source in sources:
+            molmo_spaces_constants.DATA_TYPE_TO_SOURCE_TO_VERSION.get(
+                data_type, {}
+            ).pop(source, None)
 
 
 def main():
@@ -60,6 +82,18 @@ def main():
         help="Number of parallel eval workers",
     )
     parser.add_argument(
+        "--max_episodes",
+        type=int,
+        default=None,
+        help="Maximum number of episodes to evaluate",
+    )
+    parser.add_argument(
+        "--episode_idx",
+        type=int,
+        default=None,
+        help="Evaluate a single episode by index",
+    )
+    parser.add_argument(
         "--use_wandb",
         action="store_true",
         help="Enable wandb logging",
@@ -81,7 +115,17 @@ def main():
         default=None,
         help="Intensity of default environmental light (filament only)",
     )
+    parser.add_argument(
+        "--use_hf_resources",
+        action="store_true",
+        help="Fetch MolmoSpaces resources from the Hugging Face mirror instead of the default R2 bucket",
+    )
     args = parser.parse_args()
+
+    if args.use_hf_resources:
+        use_huggingface_molmo_spaces_resources()
+
+    from molmo_spaces.evaluation.eval_main import run_evaluation
 
     # Resolve module:ClassName string to actual class so mujoco-thor uses __name__
     # (not the full "module:ClassName" string) when constructing the output directory.
@@ -97,6 +141,8 @@ def main():
         task_horizon_steps=args.task_horizon,
         output_dir=args.output_dir,
         num_workers=args.num_workers,
+        max_episodes=args.max_episodes,
+        episode_idx=args.episode_idx,
         use_wandb=args.use_wandb,
         wandb_project=args.wandb_project,
         use_filament=args.use_filament,
@@ -110,4 +156,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

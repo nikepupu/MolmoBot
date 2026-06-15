@@ -1,10 +1,8 @@
 import numpy as np
 import torch
 from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
-from molmo_spaces.configs.robot_configs import FrankaRobotConfig
 from molmo_spaces.configs.policy_configs import BasePolicyConfig
 from molmo_spaces.policy.base_policy import InferencePolicy
-from molmo_spaces.evaluation.configs.evaluation_configs import JsonBenchmarkEvalConfig
 
 
 
