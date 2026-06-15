@@ -165,7 +165,14 @@ During rollout, press `s` to pause/resume, `r` to reset the arm, `i` to change t
 
 The GR00T DROID stack in `/home/gear/Projects/gr00t/groot/control/envs/droid` should be used for N1.7 checkpoints. It reads the server modality config, builds the request from the checkpoint schema, and executes the returned `action.joint_position` through `RobotEnv(action_space="joint_position")`.
 
-This flow depends on the GR00T checkout and its `gear_droid` external dependency. If the DROID stack is not initialized yet, set it up from the GR00T repo:
+This flow depends on the GR00T checkout and its `gear_droid` external dependency. Clone GR00T next to this repository under `/home/gear/Projects/gr00t`:
+
+```bash
+cd /home/gear/Projects
+git clone ssh://git@gitlab-master.nvidia.com:12051/GR00T/gr00t/gr00t.git gr00t
+```
+
+If the DROID stack is not initialized yet, set it up from the GR00T repo:
 
 ```bash
 cd /home/gear/Projects/gr00t
