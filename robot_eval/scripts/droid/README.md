@@ -218,6 +218,52 @@ uv run --no-sync python -m groot.control.main.vla.run_gr00t_server \
   --num-inference-timesteps 4
 ```
 
+To evaluate the same checkpoint in MolmoSpaces pick-only simulation, keep the
+server running in one terminal and launch the MolmoSpaces eval in another.
+
+Terminal 1, GR00T policy server:
+
+```bash
+cd /home/gear/Projects/gr00t/groot/control/envs/droid
+
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 NO_ALBUMENTATIONS_UPDATE=1 \
+uv run --no-sync \
+  python -m groot.control.main.vla.run_gr00t_server \
+    --model-path /home/gear/Projects/molmobot_checkpoint \
+    --embodiment-tag OXE_DROID_JOINT_POSITION_RELATIVE \
+    --policy-type gr00t \
+    --device cuda \
+    --port 5555 \
+    --num-inference-timesteps 4 \
+    --use-sim-policy-wrapper \
+    --rtc-control-freq 15 \
+    --rtc-action-horizon 24
+```
+
+Terminal 2, MolmoSpaces eval:
+
+```bash
+cd /home/gear/Projects/MolmoBot/MolmoBot
+source .venv/bin/activate
+
+export MUJOCO_GL=egl
+export PYOPENGL_PLATFORM=egl
+export JAX_PLATFORMS=cpu
+export MLSPACES_CACHE_DIR=$PWD/.mlspaces_cache
+export MLSPACES_ASSETS_DIR=$PWD/molmo_spaces_assets
+export MPLCONFIGDIR=/tmp/mplconfig
+export PYTHONUNBUFFERED=1
+
+python launch_scripts/run_eval.py \
+  --use_hf_resources \
+  --checkpoint_path /home/gear/Projects/molmobot_checkpoint \
+  --benchmark_path "$MLSPACES_CACHE_DIR/benchmarks/molmospaces-bench-v2/20260325_1/procthor-objaverse/FrankaPickHardBench/FrankaPickHardBench_20260206_json_benchmark" \
+  --eval_config_cls olmo.eval.configure_molmo_spaces:Gr00tDroidJointPosServerFrankaThreeViewConfig \
+  --task_horizon 600 \
+  --max_episodes 100 \
+  --output_dir eval_output/gr00t-full-droid8-threeview-grip255-pick-100
+```
+
 Run the DROID hardware client:
 
 ```bash
